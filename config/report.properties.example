@@ -1,0 +1,42 @@
+# Copy this file to report.properties and fill in your local values
+
+# Database connection (override via CLI if needed)
+db.url=jdbc:sqlserver://HOST:1433;databaseName=DB;encrypt=true;trustServerCertificate=true
+db.user=SA
+db.password=
+
+# Report output (relative to the project root if not absolute)
+report.output=reports
+report.contract=31502
+
+# Header parameters (tab-separated lists)
+report.param11=M1\tV1\tM2\tV2\tM1гв\tV1гв\tM2гв\tV2гв
+report.param12=-\t-\t-\t-\t-\t-\t-\t-
+report.param13=-\t-\t-\t-\t-\t-\t-\t-
+report.param14=-\t-\t-\t-\t-\t-\t-\t-
+report.param15=-\t-\t-\t-\t-\t-\t-\t-
+report.param16=-\t-\t-\t-\t-\t-\t-\t-
+report.param17=2\t2\t2\t2\t2\t2\t2\t2
+
+# Header labels
+header.contract.label=Номер договора теплоснабжения:
+header.scheme.label=Код схемы измерений:
+header.type.label=Код типа тепловычислителя:
+header.serial.label=Номер тепловычислителя:
+header.param11.label=Канал измерения массы (объема):
+header.param12.label=Код типа преобразователя:
+header.param13.label=Условный диаметр, мм:
+header.param14.label=Цена импульса, л/имп.:
+header.param15.label=Нижняя граница диапазона измерений, т/ч:
+header.param16.label=Верхняя граница диапазона измерений, т/ч:
+header.param17.label=Допускаемая погрешность измерений, %:
+
+# Scheme headers and units
+scheme.SI-1.header=Дата\tВремя\tM1\tV1\tt1\tP1\tW1\tM2\tV2\tt2\tP2\tW2\tdM\tdW\ttхв\tPхв\tTо\tTр\tTоо\tНС
+scheme.SI-1.units=дд.мм.гггг\tч\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tт\tм3\tT*\tT*\tT*\t-
+
+scheme.SI-4.header=Дата\tВремя\tM1\tV1\tt1\tP1\tW1\tM2\tV2\tt2\tP2\tW2\tdM\tdW\tM1гв\tV1гв\tt1гв\tP1гв\tW1гв\ttхв\tPхв\tTо\tTр\tTоо\tTогв\tНС
+scheme.SI-4.units=дд.мм.гггг\tч\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tт\tм3\tгр.C\tP*\tW*\tгр.C\tP*\tT*\tT*\tT*\tT*\t-
+
+scheme.SI-5.header=Дата\tВремя\tM1\tV1\tt1\tP1\tW1\tM2\tV2\tt2\tP2\tW2\tdM\tdW\tM1гв\tV1гв\tt1гв\tP1гв\tW1гв\tM2гв\tV2гв\tt2гв\tP2гв\tW2гв\tdMгв\tdWгв\ttхв\tPхв\tTо\tTр\tTоо\tTогв\tНС
+scheme.SI-5.units=дд.мм.гггг\tч\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tгр.C\tP*\tT*\tT*\tT*\tT*\t-

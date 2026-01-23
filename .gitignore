@@ -1,0 +1,22 @@
+# Gradle
+/.gradle/
+/build/
+/out/
+
+# Run outputs
+/reports/
+
+# Logs
+*.log
+
+# Local config (keep example)
+/config/report.properties
+
+# IDE / OS
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+
+# Temp
+/.tmp-gradle-wrapper/
