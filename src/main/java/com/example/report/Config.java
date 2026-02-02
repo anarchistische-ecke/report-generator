@@ -36,6 +36,11 @@ final class Config {
     final String headerParam17Label;
     final Map<Scheme, String> schemeHeaders;
     final Map<Scheme, String> schemeUnits;
+    final String equipTable;
+    final String equipNameColumn;
+    final String equipSerialColumn;
+    final String equipNextCheckColumn;
+    final String equipLastCheckColumn;
 
     private Config(Properties props, Map<Scheme, String> schemeHeaders, Map<Scheme, String> schemeUnits) {
         this.dbUrl = props.getProperty("db.url", "");
@@ -63,6 +68,11 @@ final class Config {
         this.headerParam17Label = props.getProperty("header.param17.label", "");
         this.schemeHeaders = schemeHeaders;
         this.schemeUnits = schemeUnits;
+        this.equipTable = props.getProperty("equip.table", "Equip");
+        this.equipNameColumn = props.getProperty("equip.name.column", "Name");
+        this.equipSerialColumn = props.getProperty("equip.serial.column", "SerialNumber");
+        this.equipNextCheckColumn = props.getProperty("equip.next_check.column", "TimeNextChecking");
+        this.equipLastCheckColumn = props.getProperty("equip.last_check.column", "TimeLastChecking");
     }
 
     static Config load(Path path) throws IOException {
@@ -106,6 +116,11 @@ final class Config {
         props.setProperty("header.param15.label", headerParam15Label);
         props.setProperty("header.param16.label", headerParam16Label);
         props.setProperty("header.param17.label", headerParam17Label);
+        props.setProperty("equip.table", equipTable);
+        props.setProperty("equip.name.column", equipNameColumn);
+        props.setProperty("equip.serial.column", equipSerialColumn);
+        props.setProperty("equip.next_check.column", equipNextCheckColumn);
+        props.setProperty("equip.last_check.column", equipLastCheckColumn);
 
         return new Config(props, schemeHeaders, schemeUnits);
     }

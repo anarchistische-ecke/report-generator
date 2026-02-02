@@ -40,3 +40,10 @@ scheme.SI-4.units=дд.мм.гггг\tч\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр
 
 scheme.SI-5.header=Дата\tВремя\tM1\tV1\tt1\tP1\tW1\tM2\tV2\tt2\tP2\tW2\tdM\tdW\tM1гв\tV1гв\tt1гв\tP1гв\tW1гв\tM2гв\tV2гв\tt2гв\tP2гв\tW2гв\tdMгв\tdWгв\ttхв\tPхв\tTо\tTр\tTоо\tTогв\tНС
 scheme.SI-5.units=дд.мм.гггг\tч\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tм3\tгр.C\tP*\tW*\tт\tW*\tгр.C\tP*\tT*\tT*\tT*\tT*\t-
+
+# Equip table/column mapping for update-checking mode
+equip.table=Equip
+equip.name.column=Name
+equip.serial.column=SerialNumber
+equip.next_check.column=TimeNextChecking
+equip.last_check.column=TimeLastChecking
