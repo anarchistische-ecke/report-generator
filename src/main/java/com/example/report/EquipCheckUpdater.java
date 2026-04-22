@@ -13,13 +13,18 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Date;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.regex.Pattern;
+import java.text.Normalizer;
 
 final class EquipCheckUpdater {
     private static final DateTimeFormatter[] DATE_FORMATS = new DateTimeFormatter[]{
@@ -43,6 +48,7 @@ final class EquipCheckUpdater {
     UpdateSummary update(Path inputPath, String ignoredSheetName, boolean hasHeader) throws IOException, SQLException {
         List<SkippedRow> skipped = new ArrayList<>();
         List<InputRow> rows = readInput(inputPath, hasHeader, skipped);
+        Map<String, List<DbDevice>> devicesByNormalizedSerial = indexDevicesByNormalizedSerial(loadDevices());
 
         String updateSql = buildUpdateSql();
         List<MissingDevice> missing = new ArrayList<>();
@@ -50,9 +56,19 @@ final class EquipCheckUpdater {
 
         try (PreparedStatement stmt = connection.prepareStatement(updateSql)) {
             for (InputRow row : rows) {
+                DbDevice device = findMatchingDevice(row, devicesByNormalizedSerial.get(row.normalizedSerial));
+                if (device == null) {
+                    if (devicesByNormalizedSerial.containsKey(row.normalizedSerial)) {
+                        skipped.add(new SkippedRow(row.rowNumber, "Ambiguous device match"));
+                    } else {
+                        missing.add(new MissingDevice(row.name, row.serial));
+                    }
+                    continue;
+                }
+
                 stmt.setDate(1, Date.valueOf(row.nextCheckDate));
-                stmt.setString(2, row.name);
-                stmt.setString(3, row.serial);
+                stmt.setString(2, device.name);
+                stmt.setString(3, device.serial);
                 int affected = stmt.executeUpdate();
                 if (affected == 0) {
                     missing.add(new MissingDevice(row.name, row.serial));
@@ -103,6 +119,59 @@ final class EquipCheckUpdater {
         return "UPDATE " + table + " SET "
                 + lastCol + " = CASE WHEN " + nextCol + " IS NOT NULL THEN " + nextCol + " ELSE " + lastCol + " END, "
                 + nextCol + " = ? WHERE " + nameCol + " = ? AND " + serialCol + " = ?";
+    }
+
+    private String buildLoadDevicesSql() {
+        String table = sqlIdentifier(config.equipTable);
+        String nameCol = sqlIdentifier(config.equipNameColumn);
+        String serialCol = sqlIdentifier(config.equipSerialColumn);
+        return "SELECT " + nameCol + ", " + serialCol + " FROM " + table;
+    }
+
+    private List<DbDevice> loadDevices() throws SQLException {
+        List<DbDevice> devices = new ArrayList<>();
+        try (PreparedStatement stmt = connection.prepareStatement(buildLoadDevicesSql());
+             ResultSet rs = stmt.executeQuery()) {
+            while (rs.next()) {
+                String name = rs.getString(1);
+                String serial = rs.getString(2);
+                String normalizedSerial = normalizeLookupValue(serial);
+                if (normalizedSerial.isEmpty()) {
+                    continue;
+                }
+                devices.add(new DbDevice(name, serial, normalizeLookupValue(name), normalizedSerial));
+            }
+        }
+        return devices;
+    }
+
+    private static Map<String, List<DbDevice>> indexDevicesByNormalizedSerial(List<DbDevice> devices) {
+        Map<String, List<DbDevice>> index = new HashMap<>();
+        for (DbDevice device : devices) {
+            index.computeIfAbsent(device.normalizedSerial, ignored -> new ArrayList<>()).add(device);
+        }
+        return index;
+    }
+
+    static DbDevice findMatchingDevice(InputRow row, List<DbDevice> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        if (candidates.size() == 1) {
+            return candidates.get(0);
+        }
+
+        DbDevice exactNormalizedNameMatch = null;
+        for (DbDevice candidate : candidates) {
+            if (!candidate.normalizedName.equals(row.normalizedName)) {
+                continue;
+            }
+            if (exactNormalizedNameMatch != null) {
+                return null;
+            }
+            exactNormalizedNameMatch = candidate;
+        }
+        return exactNormalizedNameMatch;
     }
 
     private static List<InputRow> readInput(Path inputPath, boolean hasHeader, List<SkippedRow> skipped)
@@ -253,6 +322,41 @@ final class EquipCheckUpdater {
         return escaped;
     }
 
+    static String normalizeLookupValue(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFKC).toUpperCase(Locale.ROOT);
+        StringBuilder result = new StringBuilder(normalized.length());
+        for (int i = 0; i < normalized.length(); i++) {
+            char ch = normalized.charAt(i);
+            if (Character.isWhitespace(ch)) {
+                continue;
+            }
+            result.append(canonicalizeConfusableChar(ch));
+        }
+        return result.toString();
+    }
+
+    private static char canonicalizeConfusableChar(char ch) {
+        return switch (ch) {
+            case 'А' -> 'A';
+            case 'В' -> 'B';
+            case 'С' -> 'C';
+            case 'Е' -> 'E';
+            case 'Н' -> 'H';
+            case 'К' -> 'K';
+            case 'М' -> 'M';
+            case 'О' -> 'O';
+            case 'Р' -> 'P';
+            case 'Т' -> 'T';
+            case 'У' -> 'Y';
+            case 'Х' -> 'X';
+            default -> ch;
+        };
+    }
+
     private static String sqlIdentifier(String identifier) {
         if (identifier == null || identifier.isBlank() || !SAFE_IDENTIFIER.matcher(identifier).matches()) {
             throw new IllegalArgumentException("Invalid SQL identifier: " + identifier);
@@ -328,12 +432,30 @@ final class EquipCheckUpdater {
         final String name;
         final String serial;
         final LocalDate nextCheckDate;
+        final String normalizedName;
+        final String normalizedSerial;
 
         InputRow(int rowNumber, String name, String serial, LocalDate nextCheckDate) {
             this.rowNumber = rowNumber;
             this.name = name;
             this.serial = serial;
             this.nextCheckDate = nextCheckDate;
+            this.normalizedName = normalizeLookupValue(name);
+            this.normalizedSerial = normalizeLookupValue(serial);
+        }
+    }
+
+    static final class DbDevice {
+        final String name;
+        final String serial;
+        final String normalizedName;
+        final String normalizedSerial;
+
+        DbDevice(String name, String serial, String normalizedName, String normalizedSerial) {
+            this.name = name;
+            this.serial = serial;
+            this.normalizedName = normalizedName;
+            this.normalizedSerial = normalizedSerial;
         }
     }
 }
