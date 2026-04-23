@@ -53,8 +53,9 @@ final class EquipCheckUpdater {
         UpdateSummary summary = new UpdateSummary(inputPath);
 
         try {
-            List<InputRow> rows = readInput(inputPath, hasHeader, summary.skipped);
-            summary.totalRows = rows.size();
+            InputData input = readInput(inputPath, hasHeader, summary.skipped);
+            List<InputRow> rows = input.rows;
+            summary.totalRows = input.totalRows;
 
             Map<String, List<DbDevice>> devicesByNormalizedSerial = indexDevicesByNormalizedSerial(loadDevices());
             String updateSql = buildUpdateSql();
@@ -207,27 +208,47 @@ final class EquipCheckUpdater {
         return exactNormalizedNameMatch;
     }
 
-    private static List<InputRow> readInput(Path inputPath, boolean hasHeader, List<SkippedRow> skipped)
+    static InputData readInput(Path inputPath, boolean hasHeader, List<SkippedRow> skipped)
             throws IOException {
         if (!Files.exists(inputPath)) {
             throw new IOException("Input file not found: " + inputPath);
         }
 
         List<InputRow> rows = new ArrayList<>();
+        int totalRows = 0;
 
         try (BufferedReader reader = openCsvReader(inputPath)) {
             String line;
-            int rowNumber = 0;
+            int physicalLineNumber = 0;
+            int recordNumber = 0;
+            int recordStartLine = 0;
+            StringBuilder record = new StringBuilder();
             while ((line = reader.readLine()) != null) {
-                rowNumber++;
-                if (hasHeader && rowNumber == 1) {
-                    continue;
+                physicalLineNumber++;
+                if (record.length() == 0) {
+                    recordStartLine = physicalLineNumber;
+                } else {
+                    record.append('\n');
                 }
-                if (line.trim().isEmpty()) {
+                record.append(line);
+
+                if (!isCsvRecordComplete(record)) {
                     continue;
                 }
 
-                List<String> columns = parseCsvLine(line);
+                recordNumber++;
+                String csvRecord = record.toString();
+                record.setLength(0);
+
+                if (hasHeader && recordNumber == 1) {
+                    continue;
+                }
+                if (csvRecord.trim().isEmpty()) {
+                    continue;
+                }
+
+                totalRows++;
+                List<String> columns = parseCsvLine(csvRecord);
                 String name = columns.size() > 0 ? columns.get(0).trim() : "";
                 String serial = columns.size() > 1 ? columns.get(1).trim() : "";
                 String rawDate = columns.size() > 2 ? columns.get(2).trim() : "";
@@ -237,21 +258,26 @@ final class EquipCheckUpdater {
                 }
 
                 if (name.isEmpty() || serial.isEmpty()) {
-                    skipped.add(new SkippedRow(rowNumber, "Missing name or serial"));
+                    skipped.add(new SkippedRow(recordStartLine, "Missing name or serial"));
                     continue;
                 }
 
                 LocalDate nextDate = parseDate(rawDate);
                 if (nextDate == null) {
-                    skipped.add(new SkippedRow(rowNumber, "Missing or invalid next checking date"));
+                    skipped.add(new SkippedRow(recordStartLine, "Missing or invalid next checking date"));
                     continue;
                 }
 
-                rows.add(new InputRow(rowNumber, name, serial, nextDate));
+                rows.add(new InputRow(recordStartLine, name, serial, nextDate));
+            }
+
+            if (record.length() > 0) {
+                totalRows++;
+                skipped.add(new SkippedRow(recordStartLine, "Unclosed quoted CSV field"));
             }
         }
 
-        return rows;
+        return new InputData(totalRows, rows);
     }
 
     private static BufferedReader openCsvReader(Path inputPath) throws IOException {
@@ -310,7 +336,11 @@ final class EquipCheckUpdater {
         return null;
     }
 
-    private static List<String> parseCsvLine(String line) {
+    static List<String> parseCsvLine(String line) {
+        return parseCsvLine(line, detectCsvDelimiter(line));
+    }
+
+    private static List<String> parseCsvLine(String line, char delimiter) {
         List<String> values = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuotes = false;
@@ -329,7 +359,7 @@ final class EquipCheckUpdater {
                     current.append(c);
                 }
             } else {
-                if (c == ',') {
+                if (c == delimiter) {
                     values.add(current.toString());
                     current.setLength(0);
                 } else if (c == '"') {
@@ -342,6 +372,48 @@ final class EquipCheckUpdater {
 
         values.add(current.toString());
         return values;
+    }
+
+    private static char detectCsvDelimiter(String line) {
+        int commas = countUnquoted(line, ',');
+        int semicolons = countUnquoted(line, ';');
+        if (semicolons > commas) {
+            return ';';
+        }
+        return ',';
+    }
+
+    private static int countUnquoted(String line, char target) {
+        int count = 0;
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (!inQuotes && c == target) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static boolean isCsvRecordComplete(CharSequence record) {
+        boolean inQuotes = false;
+        for (int i = 0; i < record.length(); i++) {
+            char c = record.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < record.length() && record.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            }
+        }
+        return !inQuotes;
     }
 
     private static String csvEscape(String value) {
@@ -644,6 +716,16 @@ final class EquipCheckUpdater {
                     describeThrowable(failure),
                     stackTraceToString(failure)
             );
+        }
+    }
+
+    static final class InputData {
+        final int totalRows;
+        final List<InputRow> rows;
+
+        InputData(int totalRows, List<InputRow> rows) {
+            this.totalRows = totalRows;
+            this.rows = rows;
         }
     }
 

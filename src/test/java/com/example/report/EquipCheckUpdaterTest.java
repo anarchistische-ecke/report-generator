@@ -1,10 +1,13 @@
 package com.example.report;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -14,6 +17,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EquipCheckUpdaterTest {
+    @TempDir
+    Path tempDir;
 
     @Test
     void normalizeLookupValueIgnoresWhitespaceAndConfusableLetters() {
@@ -29,6 +34,37 @@ class EquipCheckUpdaterTest {
                 EquipCheckUpdater.normalizeLookupValue(" АВC 123 "),
                 EquipCheckUpdater.normalizeLookupValue("ABC123")
         );
+    }
+
+    @Test
+    void parseCsvLineSupportsSemicolonDelimitedFiles() {
+        List<String> columns = EquipCheckUpdater.parseCsvLine("ПРЭМ;523005;31.08.29");
+
+        assertEquals(List.of("ПРЭМ", "523005", "31.08.29"), columns);
+    }
+
+    @Test
+    void parseCsvLineSupportsQuotedSemicolonDelimitedFiles() {
+        List<String> columns = EquipCheckUpdater.parseCsvLine("\"КТСП;Н\";\"25686Г\";31.07.29");
+
+        assertEquals(List.of("КТСП;Н", "25686Г", "31.07.29"), columns);
+    }
+
+    @Test
+    void readInputSupportsQuotedMultilineCsvRecords() throws Exception {
+        Path input = tempDir.resolve("data.csv");
+        Files.writeString(input, "ТСП-Н;\"3960\n зип №10285\";25.08.29\nПРЭМ;523005;31.08.29\n");
+        List<EquipCheckUpdater.SkippedRow> skipped = new ArrayList<>();
+
+        EquipCheckUpdater.InputData data = EquipCheckUpdater.readInput(input, false, skipped);
+
+        assertEquals(2, data.totalRows);
+        assertEquals(2, data.rows.size());
+        assertEquals(0, skipped.size());
+        assertEquals(1, data.rows.get(0).rowNumber);
+        assertEquals("3960\n зип №10285", data.rows.get(0).serial);
+        assertEquals(LocalDate.of(2029, 8, 25), data.rows.get(0).nextCheckDate);
+        assertEquals(3, data.rows.get(1).rowNumber);
     }
 
     @Test
