@@ -55,6 +55,7 @@ public final class Main {
             EquipCheckUpdater updater = new EquipCheckUpdater(connection, config);
             EquipCheckUpdater.UpdateSummary summary = updater.update(parsed.inputPath, parsed.inputSheet, parsed.inputHasHeader);
             summary.log();
+            summary.throwIfFailed();
         }
     }
 }

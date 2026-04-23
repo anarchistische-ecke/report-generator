@@ -2,12 +2,16 @@ package com.example.report;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
+import java.sql.SQLException;
 import java.time.LocalDate;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EquipCheckUpdaterTest {
 
@@ -86,5 +90,48 @@ class EquipCheckUpdaterTest {
                 );
 
         assertNull(EquipCheckUpdater.findMatchingDevice(row, List.of(first, second)));
+    }
+
+    @Test
+    void buildUpdateLogContentsIncludesSkippedMissingAndWriteErrors() {
+        EquipCheckUpdater.UpdateSummary summary =
+                new EquipCheckUpdater.UpdateSummary(Path.of("/tmp/input.csv"));
+        summary.totalRows = 5;
+        summary.updatedRows = 2;
+        summary.skipped.add(new EquipCheckUpdater.SkippedRow(7, "Missing name or serial"));
+        summary.missing.add(new EquipCheckUpdater.MissingDevice("Meter A", "SN001"));
+        summary.missingCsvPath = Path.of("/tmp/UPDATE 23-04-2026.csv");
+        summary.writeErrors.add(new EquipCheckUpdater.WriteError(
+                "DB update",
+                9,
+                "Meter B",
+                "SN002",
+                "java.sql.SQLException: deadlock victim",
+                "java.sql.SQLException: deadlock victim\n\tat test\n"
+        ));
+
+        String logContents = EquipCheckUpdater.buildUpdateLogContents(summary);
+
+        assertTrue(logContents.contains("Status: COMPLETED_WITH_ERRORS"));
+        assertTrue(logContents.contains("Missing CSV: /tmp/UPDATE 23-04-2026.csv"));
+        assertTrue(logContents.contains("Skipped rows"));
+        assertTrue(logContents.contains("Row 7: Missing name or serial"));
+        assertTrue(logContents.contains("Missing devices"));
+        assertTrue(logContents.contains("Name=\"Meter A\", Serial=\"SN001\""));
+        assertTrue(logContents.contains("Write errors"));
+        assertTrue(logContents.contains("Row 9 | DB update | Name=\"Meter B\" | Serial=\"SN002\" | java.sql.SQLException: deadlock victim"));
+    }
+
+    @Test
+    void throwIfFailedRethrowsFatalFailure() {
+        EquipCheckUpdater.UpdateSummary summary =
+                new EquipCheckUpdater.UpdateSummary(Path.of("/tmp/input.csv"));
+        SQLException failure = new SQLException("connection lost");
+
+        summary.recordFatalFailure("Updater execution", failure);
+
+        SQLException thrown = assertThrows(SQLException.class, summary::throwIfFailed);
+        assertEquals("connection lost", thrown.getMessage());
+        assertEquals("FAILED", summary.status());
     }
 }
