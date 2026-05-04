@@ -60,7 +60,14 @@ final class DevicesListExporter {
                 SELECT
                     a.Id,
                     a.AddressId,
-                    CAST(CONCAT_WS(N', ', ap.FullName, NULLIF(LTRIM(RTRIM(a.Name)), N'')) AS nvarchar(max)) AS FullName
+                    CAST(
+                        CASE
+                            WHEN ap.FullName IS NULL THEN NULLIF(LTRIM(RTRIM(a.Name)), N'')
+                            WHEN NULLIF(LTRIM(RTRIM(a.Name)), N'') IS NULL THEN ap.FullName
+                            ELSE ap.FullName + N', ' + LTRIM(RTRIM(a.Name))
+                        END
+                        AS nvarchar(max)
+                    ) AS FullName
                 FROM dbo.Address a
                 JOIN AddressPath ap ON ap.Id = a.AddressId
             ),
@@ -70,7 +77,11 @@ final class DevicesListExporter {
                     et.Name AS Model,
                     etm.Name AS DeviceExecution,
                     e.SerialNumber,
-                    NULLIF(CONCAT_WS(N', ', NULLIF(LTRIM(RTRIM(ap.FullName)), N''), NULLIF(LTRIM(RTRIM(n.Name)), N'')), N'') AS ObjectName,
+                    CASE
+                        WHEN NULLIF(LTRIM(RTRIM(ap.FullName)), N'') IS NULL THEN NULLIF(LTRIM(RTRIM(n.Name)), N'')
+                        WHEN NULLIF(LTRIM(RTRIM(n.Name)), N'') IS NULL THEN NULLIF(LTRIM(RTRIM(ap.FullName)), N'')
+                        ELSE LTRIM(RTRIM(ap.FullName)) + N', ' + LTRIM(RTRIM(n.Name))
+                    END AS ObjectName,
                     CAST(e.TimeLastChecking AS date) AS TimeLastChecking,
                     CAST(e.TimeNextChecking AS date) AS TimeNextChecking
                 FROM dbo.Equip e
