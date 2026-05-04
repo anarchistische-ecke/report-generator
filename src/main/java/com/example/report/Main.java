@@ -16,6 +16,11 @@ public final class Main {
                 return;
             }
 
+            if ("devices-export".equalsIgnoreCase(parsed.mode)) {
+                runDevicesExport(parsed, config);
+                return;
+            }
+
             if (parsed.from == null || parsed.to == null) {
                 throw new IllegalArgumentException("--from and --to are required (yyyy-MM-dd)");
             }
@@ -36,7 +41,7 @@ public final class Main {
                 }
             }
         } catch (Exception ex) {
-            Logger.error("Report generation failed", ex);
+            Logger.error("Execution failed", ex);
             System.exit(1);
         }
     }
@@ -56,6 +61,19 @@ public final class Main {
             EquipCheckUpdater.UpdateSummary summary = updater.update(parsed.inputPath, parsed.inputSheet, parsed.inputHasHeader);
             summary.log();
             summary.throwIfFailed();
+        }
+    }
+
+    private static void runDevicesExport(Args parsed, Config config) throws Exception {
+        if (config.dbUrl.isBlank() || config.dbUser.isBlank() || config.dbPassword.isBlank()) {
+            throw new IllegalArgumentException("Database credentials are missing. Set in config or pass --db-url/--db-user/--db-pass.");
+        }
+
+        Logger.info("Using config: " + Path.of(parsed.configPath.toString()).toAbsolutePath());
+        try (Connection connection = DriverManager.getConnection(config.dbUrl, config.dbUser, config.dbPassword)) {
+            DevicesListExporter exporter = new DevicesListExporter(connection, config);
+            DevicesListExporter.ExportSummary summary = exporter.export();
+            Logger.info("Devices exported: " + summary.rowCount + " rows -> " + summary.outputFile.toAbsolutePath());
         }
     }
 }
