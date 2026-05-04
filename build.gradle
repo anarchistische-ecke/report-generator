@@ -9,6 +9,7 @@ repositories {
 
 dependencies {
     implementation 'com.microsoft.sqlserver:mssql-jdbc:12.6.1.jre11'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
 }
 
 application {
@@ -31,4 +32,8 @@ distributions {
             }
         }
     }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }

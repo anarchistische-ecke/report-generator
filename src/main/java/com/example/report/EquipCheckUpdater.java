@@ -1,0 +1,763 @@
+package com.example.report;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.io.PushbackInputStream;
+import java.io.StringWriter;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.text.Normalizer;
+
+final class EquipCheckUpdater {
+    private static final DateTimeFormatter[] DATE_FORMATS = new DateTimeFormatter[]{
+            DateTimeFormatter.ofPattern("dd.MM.yy"),
+            DateTimeFormatter.ofPattern("d.M.yy"),
+            DateTimeFormatter.ofPattern("dd.MM.yyyy"),
+            DateTimeFormatter.ofPattern("d.M.yyyy")
+    };
+
+    private static final DateTimeFormatter CSV_DATE = DateTimeFormatter.ofPattern("dd-MM-yyyy");
+    private static final DateTimeFormatter LOG_TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final Pattern SAFE_IDENTIFIER = Pattern.compile("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*");
+
+    private final Connection connection;
+    private final Config config;
+
+    EquipCheckUpdater(Connection connection, Config config) {
+        this.connection = connection;
+        this.config = config;
+    }
+
+    UpdateSummary update(Path inputPath, String ignoredSheetName, boolean hasHeader) {
+        UpdateSummary summary = new UpdateSummary(inputPath);
+
+        try {
+            InputData input = readInput(inputPath, hasHeader, summary.skipped);
+            List<InputRow> rows = input.rows;
+            summary.totalRows = input.totalRows;
+
+            Map<String, List<DbDevice>> devicesByNormalizedSerial = indexDevicesByNormalizedSerial(loadDevices());
+            String updateSql = buildUpdateSql();
+
+            try (PreparedStatement stmt = connection.prepareStatement(updateSql)) {
+                for (InputRow row : rows) {
+                    DbDevice device = findMatchingDevice(row, devicesByNormalizedSerial.get(row.normalizedSerial));
+                    if (device == null) {
+                        if (devicesByNormalizedSerial.containsKey(row.normalizedSerial)) {
+                            summary.skipped.add(new SkippedRow(row.rowNumber, "Ambiguous device match"));
+                        } else {
+                            summary.missing.add(new MissingDevice(row.name, row.serial));
+                        }
+                        continue;
+                    }
+
+                    try {
+                        stmt.setDate(1, Date.valueOf(row.nextCheckDate));
+                        stmt.setString(2, device.name);
+                        stmt.setString(3, device.serial);
+                        int affected = stmt.executeUpdate();
+                        if (affected == 0) {
+                            summary.missing.add(new MissingDevice(row.name, row.serial));
+                        } else {
+                            summary.updatedRows += affected;
+                        }
+                    } catch (SQLException ex) {
+                        summary.writeErrors.add(WriteError.forRow("DB update", row, ex));
+                        Logger.error("Failed to update row " + row.rowNumber
+                                + " (name=\"" + row.name + "\", serial=\"" + row.serial + "\")", ex);
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            summary.recordFatalFailure("Updater execution", ex);
+        } finally {
+            finalizeSummary(inputPath, summary);
+        }
+
+        return summary;
+    }
+
+    private void finalizeSummary(Path inputPath, UpdateSummary summary) {
+        try {
+            summary.missingCsvPath = writeMissingCsv(inputPath, summary.missing);
+        } catch (IOException ex) {
+            summary.writeErrors.add(WriteError.general("Write missing CSV", ex));
+            Logger.error("Failed to write missing devices CSV", ex);
+        }
+
+        try {
+            summary.logFilePath = writeUpdateLog(inputPath, summary);
+        } catch (IOException ex) {
+            summary.recordFatalFailure("Write update log", ex);
+            Logger.error("Failed to write update log", ex);
+        }
+    }
+
+    private Path writeMissingCsv(Path inputPath, List<MissingDevice> missing) throws IOException {
+        if (missing.isEmpty()) {
+            return null;
+        }
+
+        Path outputPath = resolveOutputDir(inputPath).resolve("UPDATE " + LocalDate.now().format(CSV_DATE) + ".csv");
+
+        try (BufferedWriter writer = Files.newBufferedWriter(outputPath, StandardCharsets.UTF_8)) {
+            writer.write("Name,Serial");
+            writer.write("\r\n");
+            for (MissingDevice device : missing) {
+                writer.write(csvEscape(device.name));
+                writer.write(',');
+                writer.write(csvEscape(device.serial));
+                writer.write("\r\n");
+            }
+        }
+
+        return outputPath;
+    }
+
+    private Path writeUpdateLog(Path inputPath, UpdateSummary summary) throws IOException {
+        Path outputPath = resolveOutputDir(inputPath).resolve("UPDATE " + LocalDate.now().format(CSV_DATE) + ".log");
+        try (BufferedWriter writer = Files.newBufferedWriter(outputPath, StandardCharsets.UTF_8)) {
+            writer.write(buildUpdateLogContents(summary));
+        }
+        return outputPath;
+    }
+
+    private String buildUpdateSql() {
+        String table = sqlIdentifier(config.equipTable);
+        String nameCol = sqlIdentifier(config.equipNameColumn);
+        String serialCol = sqlIdentifier(config.equipSerialColumn);
+        String nextCol = sqlIdentifier(config.equipNextCheckColumn);
+        String lastCol = sqlIdentifier(config.equipLastCheckColumn);
+
+        return "UPDATE " + table + " SET "
+                + lastCol + " = CASE WHEN " + nextCol + " IS NOT NULL THEN " + nextCol + " ELSE " + lastCol + " END, "
+                + nextCol + " = ? WHERE " + nameCol + " = ? AND " + serialCol + " = ?";
+    }
+
+    private String buildLoadDevicesSql() {
+        String table = sqlIdentifier(config.equipTable);
+        String nameCol = sqlIdentifier(config.equipNameColumn);
+        String serialCol = sqlIdentifier(config.equipSerialColumn);
+        return "SELECT " + nameCol + ", " + serialCol + " FROM " + table;
+    }
+
+    private List<DbDevice> loadDevices() throws SQLException {
+        List<DbDevice> devices = new ArrayList<>();
+        try (PreparedStatement stmt = connection.prepareStatement(buildLoadDevicesSql());
+             ResultSet rs = stmt.executeQuery()) {
+            while (rs.next()) {
+                String name = rs.getString(1);
+                String serial = rs.getString(2);
+                String normalizedSerial = normalizeLookupValue(serial);
+                if (normalizedSerial.isEmpty()) {
+                    continue;
+                }
+                devices.add(new DbDevice(name, serial, normalizeLookupValue(name), normalizedSerial));
+            }
+        }
+        return devices;
+    }
+
+    private static Map<String, List<DbDevice>> indexDevicesByNormalizedSerial(List<DbDevice> devices) {
+        Map<String, List<DbDevice>> index = new HashMap<>();
+        for (DbDevice device : devices) {
+            index.computeIfAbsent(device.normalizedSerial, ignored -> new ArrayList<>()).add(device);
+        }
+        return index;
+    }
+
+    static DbDevice findMatchingDevice(InputRow row, List<DbDevice> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        if (candidates.size() == 1) {
+            return candidates.get(0);
+        }
+
+        DbDevice exactNormalizedNameMatch = null;
+        for (DbDevice candidate : candidates) {
+            if (!candidate.normalizedName.equals(row.normalizedName)) {
+                continue;
+            }
+            if (exactNormalizedNameMatch != null) {
+                return null;
+            }
+            exactNormalizedNameMatch = candidate;
+        }
+        return exactNormalizedNameMatch;
+    }
+
+    static InputData readInput(Path inputPath, boolean hasHeader, List<SkippedRow> skipped)
+            throws IOException {
+        if (!Files.exists(inputPath)) {
+            throw new IOException("Input file not found: " + inputPath);
+        }
+
+        List<InputRow> rows = new ArrayList<>();
+        int totalRows = 0;
+
+        try (BufferedReader reader = openCsvReader(inputPath)) {
+            String line;
+            int physicalLineNumber = 0;
+            int recordNumber = 0;
+            int recordStartLine = 0;
+            StringBuilder record = new StringBuilder();
+            while ((line = reader.readLine()) != null) {
+                physicalLineNumber++;
+                if (record.length() == 0) {
+                    recordStartLine = physicalLineNumber;
+                } else {
+                    record.append('\n');
+                }
+                record.append(line);
+
+                if (!isCsvRecordComplete(record)) {
+                    continue;
+                }
+
+                recordNumber++;
+                String csvRecord = record.toString();
+                record.setLength(0);
+
+                if (hasHeader && recordNumber == 1) {
+                    continue;
+                }
+                if (csvRecord.trim().isEmpty()) {
+                    continue;
+                }
+
+                totalRows++;
+                List<String> columns = parseCsvLine(csvRecord);
+                String name = columns.size() > 0 ? columns.get(0).trim() : "";
+                String serial = columns.size() > 1 ? columns.get(1).trim() : "";
+                String rawDate = columns.size() > 2 ? columns.get(2).trim() : "";
+
+                if (name.isEmpty() && serial.isEmpty()) {
+                    continue;
+                }
+
+                if (name.isEmpty() || serial.isEmpty()) {
+                    skipped.add(new SkippedRow(recordStartLine, "Missing name or serial"));
+                    continue;
+                }
+
+                LocalDate nextDate = parseDate(rawDate);
+                if (nextDate == null) {
+                    skipped.add(new SkippedRow(recordStartLine, "Missing or invalid next checking date"));
+                    continue;
+                }
+
+                rows.add(new InputRow(recordStartLine, name, serial, nextDate));
+            }
+
+            if (record.length() > 0) {
+                totalRows++;
+                skipped.add(new SkippedRow(recordStartLine, "Unclosed quoted CSV field"));
+            }
+        }
+
+        return new InputData(totalRows, rows);
+    }
+
+    private static BufferedReader openCsvReader(Path inputPath) throws IOException {
+        InputStream input = Files.newInputStream(inputPath);
+        PushbackInputStream pushback = new PushbackInputStream(input, 3);
+        byte[] bom = new byte[3];
+        int read = pushback.read(bom, 0, 3);
+        Charset charset;
+        int unread;
+
+        if (read == -1) {
+            charset = Charset.defaultCharset();
+            unread = 0;
+        } else if (read >= 3 && (bom[0] == (byte) 0xEF) && (bom[1] == (byte) 0xBB) && (bom[2] == (byte) 0xBF)) {
+            charset = StandardCharsets.UTF_8;
+            unread = read - 3;
+        } else {
+            charset = Charset.defaultCharset();
+            unread = read;
+        }
+
+        if (unread > 0) {
+            pushback.unread(bom, read - unread, unread);
+        }
+
+        return new BufferedReader(new InputStreamReader(pushback, charset));
+    }
+
+    private static LocalDate parseDate(String raw) {
+        if (raw == null) {
+            return null;
+        }
+
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+
+        for (DateTimeFormatter fmt : DATE_FORMATS) {
+            try {
+                return LocalDate.parse(trimmed, fmt);
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+
+        String normalized = trimmed.replace(',', '.');
+        try {
+            double value = Double.parseDouble(normalized);
+            if (value > 0) {
+                long days = (long) Math.floor(value);
+                return LocalDate.of(1899, 12, 30).plusDays(days);
+            }
+        } catch (NumberFormatException ignored) {
+        }
+
+        return null;
+    }
+
+    static List<String> parseCsvLine(String line) {
+        return parseCsvLine(line, detectCsvDelimiter(line));
+    }
+
+    private static List<String> parseCsvLine(String line, char delimiter) {
+        List<String> values = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current.append(c);
+                }
+            } else {
+                if (c == delimiter) {
+                    values.add(current.toString());
+                    current.setLength(0);
+                } else if (c == '"') {
+                    inQuotes = true;
+                } else {
+                    current.append(c);
+                }
+            }
+        }
+
+        values.add(current.toString());
+        return values;
+    }
+
+    private static char detectCsvDelimiter(String line) {
+        int commas = countUnquoted(line, ',');
+        int semicolons = countUnquoted(line, ';');
+        if (semicolons > commas) {
+            return ';';
+        }
+        return ',';
+    }
+
+    private static int countUnquoted(String line, char target) {
+        int count = 0;
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (!inQuotes && c == target) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static boolean isCsvRecordComplete(CharSequence record) {
+        boolean inQuotes = false;
+        for (int i = 0; i < record.length(); i++) {
+            char c = record.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i + 1 < record.length() && record.charAt(i + 1) == '"') {
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            }
+        }
+        return !inQuotes;
+    }
+
+    private static String csvEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        String escaped = value.replace("\"", "\"\"");
+        if (escaped.contains(",") || escaped.contains("\"") || escaped.contains("\n") || escaped.contains("\r")) {
+            return "\"" + escaped + "\"";
+        }
+        return escaped;
+    }
+
+    private static Path resolveOutputDir(Path inputPath) {
+        Path outputDir = inputPath.toAbsolutePath().getParent();
+        if (outputDir == null) {
+            return Path.of(".").toAbsolutePath();
+        }
+        return outputDir;
+    }
+
+    static String buildUpdateLogContents(UpdateSummary summary) {
+        String lineSeparator = System.lineSeparator();
+        StringBuilder builder = new StringBuilder();
+        builder.append("Update checking log").append(lineSeparator);
+        builder.append("Generated: ").append(LOG_TS.format(LocalDateTime.now())).append(lineSeparator);
+        builder.append("Status: ").append(summary.status()).append(lineSeparator);
+        builder.append("Input rows: ").append(summary.totalRows).append(lineSeparator);
+        builder.append("Updated rows: ").append(summary.updatedRows).append(lineSeparator);
+        builder.append("Missing rows: ").append(summary.missing.size()).append(lineSeparator);
+        builder.append("Skipped rows: ").append(summary.skipped.size()).append(lineSeparator);
+        builder.append("Write errors: ").append(summary.writeErrors.size()).append(lineSeparator);
+        if (summary.missingCsvPath != null) {
+            builder.append("Missing CSV: ").append(summary.missingCsvPath.toAbsolutePath()).append(lineSeparator);
+        }
+        builder.append(lineSeparator);
+
+        appendSkippedSection(builder, summary.skipped, lineSeparator);
+        appendMissingSection(builder, summary.missing, lineSeparator);
+        appendWriteErrorsSection(builder, summary.writeErrors, lineSeparator);
+
+        return builder.toString();
+    }
+
+    private static void appendSkippedSection(StringBuilder builder, List<SkippedRow> skipped, String lineSeparator) {
+        builder.append("Skipped rows").append(lineSeparator);
+        if (skipped.isEmpty()) {
+            builder.append("none").append(lineSeparator).append(lineSeparator);
+            return;
+        }
+        for (SkippedRow row : skipped) {
+            builder.append("Row ")
+                    .append(row.rowNumber)
+                    .append(": ")
+                    .append(row.reason)
+                    .append(lineSeparator);
+        }
+        builder.append(lineSeparator);
+    }
+
+    private static void appendMissingSection(StringBuilder builder, List<MissingDevice> missing, String lineSeparator) {
+        builder.append("Missing devices").append(lineSeparator);
+        if (missing.isEmpty()) {
+            builder.append("none").append(lineSeparator).append(lineSeparator);
+            return;
+        }
+        for (MissingDevice device : missing) {
+            builder.append("Name=\"")
+                    .append(sanitizeLogValue(device.name))
+                    .append("\", Serial=\"")
+                    .append(sanitizeLogValue(device.serial))
+                    .append('"')
+                    .append(lineSeparator);
+        }
+        builder.append(lineSeparator);
+    }
+
+    private static void appendWriteErrorsSection(StringBuilder builder, List<WriteError> writeErrors, String lineSeparator) {
+        builder.append("Write errors").append(lineSeparator);
+        if (writeErrors.isEmpty()) {
+            builder.append("none").append(lineSeparator);
+            return;
+        }
+        for (WriteError error : writeErrors) {
+            if (error.rowNumber != null) {
+                builder.append("Row ").append(error.rowNumber).append(" | ");
+            }
+            builder.append(error.operation);
+            if (error.name != null && !error.name.isBlank()) {
+                builder.append(" | Name=\"").append(sanitizeLogValue(error.name)).append('"');
+            }
+            if (error.serial != null && !error.serial.isBlank()) {
+                builder.append(" | Serial=\"").append(sanitizeLogValue(error.serial)).append('"');
+            }
+            builder.append(" | ")
+                    .append(error.message)
+                    .append(lineSeparator)
+                    .append(error.stackTrace);
+            if (!error.stackTrace.endsWith(lineSeparator)) {
+                builder.append(lineSeparator);
+            }
+            builder.append(lineSeparator);
+        }
+    }
+
+    private static String sanitizeLogValue(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("\r", "\\r").replace("\n", "\\n");
+    }
+
+    private static String describeThrowable(Throwable throwable) {
+        String message = throwable.getMessage();
+        if (message == null || message.isBlank()) {
+            return throwable.getClass().getName();
+        }
+        return throwable.getClass().getName() + ": " + message;
+    }
+
+    private static String stackTraceToString(Throwable throwable) {
+        StringWriter writer = new StringWriter();
+        try (PrintWriter printWriter = new PrintWriter(writer)) {
+            throwable.printStackTrace(printWriter);
+        }
+        return writer.toString();
+    }
+
+    static String normalizeLookupValue(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFKC).toUpperCase(Locale.ROOT);
+        StringBuilder result = new StringBuilder(normalized.length());
+        for (int i = 0; i < normalized.length(); i++) {
+            char ch = normalized.charAt(i);
+            if (Character.isWhitespace(ch)) {
+                continue;
+            }
+            result.append(canonicalizeConfusableChar(ch));
+        }
+        return result.toString();
+    }
+
+    private static char canonicalizeConfusableChar(char ch) {
+        return switch (ch) {
+            case 'А' -> 'A';
+            case 'В' -> 'B';
+            case 'С' -> 'C';
+            case 'Е' -> 'E';
+            case 'Н' -> 'H';
+            case 'К' -> 'K';
+            case 'М' -> 'M';
+            case 'О' -> 'O';
+            case 'Р' -> 'P';
+            case 'Т' -> 'T';
+            case 'У' -> 'Y';
+            case 'Х' -> 'X';
+            default -> ch;
+        };
+    }
+
+    private static String sqlIdentifier(String identifier) {
+        if (identifier == null || identifier.isBlank() || !SAFE_IDENTIFIER.matcher(identifier).matches()) {
+            throw new IllegalArgumentException("Invalid SQL identifier: " + identifier);
+        }
+        String[] parts = identifier.split("\\.");
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) {
+                result.append('.');
+            }
+            result.append('[').append(parts[i]).append(']');
+        }
+        return result.toString();
+    }
+
+    static final class UpdateSummary {
+        final Path inputPath;
+        int totalRows;
+        int updatedRows;
+        final List<MissingDevice> missing = new ArrayList<>();
+        final List<SkippedRow> skipped = new ArrayList<>();
+        final List<WriteError> writeErrors = new ArrayList<>();
+        Path missingCsvPath;
+        Path logFilePath;
+        Exception fatalFailure;
+
+        UpdateSummary(Path inputPath) {
+            this.inputPath = inputPath;
+        }
+
+        void recordFatalFailure(String operation, Exception failure) {
+            if (fatalFailure == null) {
+                fatalFailure = failure;
+            }
+            writeErrors.add(WriteError.general(operation, failure));
+        }
+
+        String status() {
+            if (fatalFailure != null) {
+                return "FAILED";
+            }
+            if (!writeErrors.isEmpty()) {
+                return "COMPLETED_WITH_ERRORS";
+            }
+            return "SUCCESS";
+        }
+
+        void throwIfFailed() throws Exception {
+            if (fatalFailure != null) {
+                throw fatalFailure;
+            }
+        }
+
+        void log() {
+            Logger.info("Update finished. Input rows: " + totalRows
+                    + ", updated: " + updatedRows
+                    + ", missing: " + missing.size()
+                    + ", skipped: " + skipped.size()
+                    + ", write errors: " + writeErrors.size()
+                    + ", status: " + status());
+
+            if (logFilePath != null) {
+                Logger.info("Update log saved to: " + logFilePath.toAbsolutePath());
+            }
+
+            if (!missing.isEmpty() && missingCsvPath != null) {
+                Logger.info("Missing devices saved to: " + missingCsvPath.toAbsolutePath());
+            }
+
+            if (!skipped.isEmpty()) {
+                Logger.info("Skipped rows:");
+                for (SkippedRow row : skipped) {
+                    Logger.info("Row " + row.rowNumber + ": " + row.reason);
+                }
+            }
+
+            if (fatalFailure != null) {
+                Logger.info("Update run aborted: " + describeThrowable(fatalFailure));
+            }
+        }
+    }
+
+    static final class MissingDevice {
+        final String name;
+        final String serial;
+
+        MissingDevice(String name, String serial) {
+            this.name = name;
+            this.serial = serial;
+        }
+    }
+
+    static final class SkippedRow {
+        final int rowNumber;
+        final String reason;
+
+        SkippedRow(int rowNumber, String reason) {
+            this.rowNumber = rowNumber;
+            this.reason = reason;
+        }
+    }
+
+    static final class WriteError {
+        final String operation;
+        final Integer rowNumber;
+        final String name;
+        final String serial;
+        final String message;
+        final String stackTrace;
+
+        WriteError(String operation, Integer rowNumber, String name, String serial, String message, String stackTrace) {
+            this.operation = operation;
+            this.rowNumber = rowNumber;
+            this.name = name;
+            this.serial = serial;
+            this.message = message;
+            this.stackTrace = stackTrace;
+        }
+
+        static WriteError forRow(String operation, InputRow row, Exception failure) {
+            return new WriteError(
+                    operation,
+                    row.rowNumber,
+                    row.name,
+                    row.serial,
+                    describeThrowable(failure),
+                    stackTraceToString(failure)
+            );
+        }
+
+        static WriteError general(String operation, Exception failure) {
+            return new WriteError(
+                    operation,
+                    null,
+                    null,
+                    null,
+                    describeThrowable(failure),
+                    stackTraceToString(failure)
+            );
+        }
+    }
+
+    static final class InputData {
+        final int totalRows;
+        final List<InputRow> rows;
+
+        InputData(int totalRows, List<InputRow> rows) {
+            this.totalRows = totalRows;
+            this.rows = rows;
+        }
+    }
+
+    static final class InputRow {
+        final int rowNumber;
+        final String name;
+        final String serial;
+        final LocalDate nextCheckDate;
+        final String normalizedName;
+        final String normalizedSerial;
+
+        InputRow(int rowNumber, String name, String serial, LocalDate nextCheckDate) {
+            this.rowNumber = rowNumber;
+            this.name = name;
+            this.serial = serial;
+            this.nextCheckDate = nextCheckDate;
+            this.normalizedName = normalizeLookupValue(name);
+            this.normalizedSerial = normalizeLookupValue(serial);
+        }
+    }
+
+    static final class DbDevice {
+        final String name;
+        final String serial;
+        final String normalizedName;
+        final String normalizedSerial;
+
+        DbDevice(String name, String serial, String normalizedName, String normalizedSerial) {
+            this.name = name;
+            this.serial = serial;
+            this.normalizedName = normalizedName;
+            this.normalizedSerial = normalizedSerial;
+        }
+    }
+}
